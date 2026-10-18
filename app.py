@@ -474,8 +474,8 @@ with localization_column:
 
 with st.expander("Inspect Grad-CAM heatmap and morphology mask"):
     heatmap_column, mask_column = st.columns(2)
-    heatmap_column.image(heatmap, caption=f"mixed10 class activation · {vehicle_class}", use_container_width=True, clamp=True)
-    mask_column.image(morphology_mask, caption="Thresholded and morphologically opened mask", use_container_width=True)
+    heatmap_column.image(heatmap, caption=f"mixed10 class activation · {vehicle_class}", width=True, clamp=True)
+    mask_column.image(morphology_mask, caption="Thresholded and morphologically opened mask", width=True)
 
 st.subheader("Localized region records", anchor=False)
 st.caption("Coordinates and contour areas are source-image pixels; class score and mean activation are distinct quantities.")
