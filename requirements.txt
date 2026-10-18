@@ -1,6 +1,6 @@
 streamlit>=1.36
-tensorflow>=2.16
-opencv-python>=4.8
+tensorflow==2.16.2
+opencv-python-headless>=4.8
 matplotlib>=3.8
 pandas>=2.0
 PyYAML>=6.0
