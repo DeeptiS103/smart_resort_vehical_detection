@@ -2,13 +2,14 @@
 
 from pathlib import Path
 from typing import Any
-
+import json
 import cv2
 import matplotlib.pyplot as plt
+import numpy as np
 import pandas as pd
 import streamlit as st
+import tensorflow as tf
 import yaml
-from ultralytics import YOLO
 
 
 # Resolve dataset and model assets relative to the application directory.
@@ -23,14 +24,19 @@ DATASET_DIR = (
 IMAGE_DIR = DATASET_DIR / "train" / "images"
 LABEL_DIR = DATASET_DIR / "train" / "labels"
 DATA_YAML = DATASET_DIR / "data.yaml"
-MODEL_PATH = BASE_DIR / "yolov8n.pt"
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
-VEHICLE_CLASS_NAMES = {2: "Car", 3: "Motorcycle", 5: "Bus", 7: "Truck"}
+INCEPTION_INPUT_SIZE = (299, 299)
+VEHICLE_LABEL_TERMS = {
+    "ambulance", "bus", "cab", "car", "convertible", "fire engine", "jeep",
+    "limousine", "minibus", "moped", "motor scooter", "motorcycle", "pickup",
+    "racer", "recreational vehicle", "taxi", "tow truck", "trailer truck", "truck",
+    "trolleybus", "van",
+}
 
 
 # Configure the dashboard for a widescreen analytical layout.
 st.set_page_config(
-    page_title="Smart Resort Vehicle Detection & Analytics",
+    page_title="Urban Street Vehicle Detection & InceptionV3 Analytics",
     page_icon="🚘",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -106,10 +112,27 @@ def load_class_names(metadata_path: str) -> list[str]:
     return [str(name) for name in names]
 
 
-@st.cache_resource(show_spinner="Loading YOLOv8n weights...")
-def load_model(model_path: str) -> YOLO:
-    # Load and cache the pretrained YOLOv8n model for Streamlit reruns.
-    return YOLO(model_path)
+@st.cache_resource(show_spinner="Loading InceptionV3 ImageNet weights...")
+def load_inception_models() -> tuple[tf.keras.Model, tf.keras.Model]:
+    # Cache ImageNet InceptionV3 and its mixed10 feature/classification bridge.
+    classifier = tf.keras.applications.inception_v3.InceptionV3(weights="imagenet")
+    gradcam_model = tf.keras.Model(
+        inputs=classifier.inputs,
+        outputs=[classifier.get_layer("mixed10").output, classifier.output],
+    )
+    return classifier, gradcam_model
+
+
+@st.cache_data(show_spinner=False)
+def load_imagenet_synset_indices() -> dict[str, int]:
+    # Map ImageNet synset strings returned by decode_predictions to logit indices.
+    class_index_path = tf.keras.utils.get_file(
+        "imagenet_class_index.json",
+        "https://storage.googleapis.com/download.tensorflow.org/data/imagenet_class_index.json",
+    )
+    with Path(class_index_path).open("r", encoding="utf-8") as index_file:
+        class_index_data = json.load(index_file)
+    return {details[0]: int(index) for index, details in class_index_data.items()}
 
 
 def list_sample_images(image_dir: Path) -> list[Path]:
@@ -159,14 +182,16 @@ def read_ground_truth(label_path: Path, image_width: int, image_height: int, cla
     return boxes
 
 
-def draw_boxes(image_bgr: Any, boxes: list[dict[str, Any]], color: tuple[int, int, int], show_confidence: bool = False) -> Any:
-    # Draw labeled bounding boxes on a copy of an OpenCV BGR image.
+def draw_boxes(image_bgr: Any, boxes: list[dict[str, Any]], color: tuple[int, int, int], show_activation: bool = False) -> Any:
+    # Draw ground-truth or Grad-CAM region boxes on a source-image copy.
     annotated = image_bgr.copy()
     for index, box in enumerate(boxes, start=1):
         top_left = (box["x_min"], box["y_min"])
         bottom_right = (box["x_max"], box["y_max"])
         cv2.rectangle(annotated, top_left, bottom_right, color, 2)
-        label = f"{box['class_name']} {box['confidence']:.2f}" if show_confidence else box["class_name"]
+        label = f"R{index} {box['class_name']}"
+        if show_activation:
+            label = f"{label} {box['mean_activation']:.2f}"
         text_y = max(18, top_left[1] - 7)
         cv2.putText(
             annotated,
@@ -181,84 +206,180 @@ def draw_boxes(image_bgr: Any, boxes: list[dict[str, Any]], color: tuple[int, in
     return annotated
 
 
-# Run pretrained COCO inference and keep vehicle categories for comparison.
-def predict_vehicles(model: YOLO, image_bgr: Any, confidence_threshold: float) -> list[dict[str, Any]]:
-    # Run YOLOv8n and retain its COCO-labeled car, motorcycle, bus, and truck boxes.
-    results = model.predict(source=image_bgr, conf=confidence_threshold, verbose=False)
-    if not results or results[0].boxes is None:
-        return []
+def is_vehicle_label(label: str) -> bool:
+    # Identify ImageNet labels representing whole vehicles, not vehicle parts.
+    normalized = label.lower().replace("_", " ")
+    if any(part in normalized for part in ("wheel", "tire", "seat", "mirror", "windshield")):
+        return False
+    return any(term in normalized for term in VEHICLE_LABEL_TERMS)
 
-    predictions: list[dict[str, Any]] = []
-    result = results[0]
-    for coordinates, confidence, class_value in zip(
-        result.boxes.xyxy.cpu().tolist(),
-        result.boxes.conf.cpu().tolist(),
-        result.boxes.cls.cpu().tolist(),
-    ):
-        class_id = int(class_value)
-        if class_id not in VEHICLE_CLASS_NAMES:
+
+def compute_gradcam(gradcam_model: tf.keras.Model, image_bgr: Any) -> tuple[np.ndarray, str, float]:
+    """Compute a class-specific Grad-CAM from InceptionV3's final mixed10 layer.
+    InceptionV3 predicts an ImageNet class for the whole image rather than
+    producing detections. The gradient of the strongest vehicle-class score
+    with respect to mixed10 is pooled into channel weights; the weighted feature
+    maps form a spatial relevance heatmap used downstream for approximate boxes.
+    """
+    image_rgb = cv2.cvtColor(image_bgr, cv2.COLOR_BGR2RGB)
+    resized = cv2.resize(image_rgb, INCEPTION_INPUT_SIZE, interpolation=cv2.INTER_AREA)
+    input_tensor = tf.keras.applications.inception_v3.preprocess_input(
+        np.expand_dims(resized.astype(np.float32), axis=0)
+    )
+    synset_indices = load_imagenet_synset_indices()
+
+    with tf.GradientTape() as tape:
+        convolution_features, class_scores = gradcam_model([input_tensor], training=False)
+        decoded_classes = tf.keras.applications.inception_v3.decode_predictions(
+            class_scores.numpy(), top=1000
+        )[0]
+        vehicle_classes = [item for item in decoded_classes if is_vehicle_label(item[1])]
+        if vehicle_classes:
+            selected_class = max(vehicle_classes, key=lambda item: item[2])
+            class_name = selected_class[1].replace("_", " ").title()
+            class_index = synset_indices[selected_class[0]]
+        else:
+            selected_class = decoded_classes[0]
+            class_name = f"No vehicle class; top: {selected_class[1].replace('_', ' ').title()}"
+            class_index = synset_indices[selected_class[0]]
+        target_score = class_scores[:, class_index]
+
+    gradients = tape.gradient(target_score, convolution_features)
+    if gradients is None:
+        raise RuntimeError("Grad-CAM gradients were not connected to the mixed10 feature map.")
+
+    channel_weights = tf.reduce_mean(gradients, axis=(1, 2), keepdims=True)
+    class_activation = tf.reduce_sum(channel_weights * convolution_features, axis=-1)[0]
+    class_activation = tf.maximum(class_activation, 0)
+    maximum_activation = tf.reduce_max(class_activation)
+    class_activation = tf.math.divide_no_nan(class_activation, maximum_activation)
+    heatmap_small = class_activation.numpy().astype(np.float32)
+    heatmap = cv2.resize(
+        heatmap_small,
+        (image_bgr.shape[1], image_bgr.shape[0]),
+        interpolation=cv2.INTER_CUBIC,
+    )
+    return np.clip(heatmap, 0.0, 1.0), class_name, float(selected_class[2])
+
+
+def localize_heatmap(heatmap: np.ndarray, threshold: float, kernel_size: int, opening_iterations: int, minimum_area_fraction: float, class_name: str, class_score: float) -> tuple[list[dict[str, Any]], np.ndarray]:
+    # Threshold Grad-CAM, open away speckle, then convert contours to regions.
+    heatmap_u8 = np.uint8(np.clip(heatmap, 0.0, 1.0) * 255)
+    _, binary_mask = cv2.threshold(
+        heatmap_u8, int(round(threshold * 255)), 255, cv2.THRESH_BINARY
+    )
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (kernel_size, kernel_size))
+    opened_mask = cv2.morphologyEx(
+        binary_mask,
+        cv2.MORPH_OPEN,
+        kernel,
+        iterations=opening_iterations,
+    )
+    contours, _ = cv2.findContours(opened_mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    minimum_area = heatmap.shape[0] * heatmap.shape[1] * minimum_area_fraction
+    regions: list[dict[str, Any]] = []
+
+    for contour in sorted(contours, key=cv2.contourArea, reverse=True):
+        area = float(cv2.contourArea(contour))
+        if area < minimum_area:
             continue
-        x_min, y_min, x_max, y_max = (int(round(value)) for value in coordinates)
-        predictions.append(
+        x_min, y_min, width, height = cv2.boundingRect(contour)
+        contour_mask = np.zeros(heatmap.shape, dtype=np.uint8)
+        cv2.drawContours(contour_mask, [contour], -1, 255, thickness=cv2.FILLED)
+        activation_values = heatmap[contour_mask > 0]
+        regions.append(
             {
-                "class_id": class_id,
-                "class_name": VEHICLE_CLASS_NAMES[class_id],
-                "confidence": float(confidence),
+                "region_id": len(regions) + 1,
+                "class_name": class_name,
+                "class_score": class_score,
+                "mean_activation": float(activation_values.mean()) if activation_values.size else 0.0,
                 "x_min": x_min,
                 "y_min": y_min,
-                "x_max": x_max,
-                "y_max": y_max,
+                "x_max": x_min + width,
+                "y_max": y_min + height,
+                "area_px": round(area),
+                "area_percent": area / (heatmap.shape[0] * heatmap.shape[1]) * 100,
             }
         )
-    return predictions
+    return regions, opened_mask
 
 
 # Render both annotation sources with consistent source-image dimensions.
-def render_comparison(image_bgr: Any, ground_truth: list[dict[str, Any]], predictions: list[dict[str, Any]]) -> plt.Figure:
-    # Render ground truth and model predictions side by side with Matplotlib.
-    ground_truth_image = draw_boxes(image_bgr, ground_truth, (255, 70, 45))
-    prediction_image = draw_boxes(image_bgr, predictions, (65, 190, 125), show_confidence=True)
-    figure, axes = plt.subplots(1, 2, figsize=(14, 6), facecolor="#f4f7f2")
-    panels = [
-        (axes[0], ground_truth_image, f"Ground Truth  /  {len(ground_truth)} objects"),
-        (axes[1], prediction_image, f"YOLOv8n Predictions  /  {len(predictions)} objects"),
-    ]
-    for axis, annotated_image, title in panels:
-        axis.imshow(cv2.cvtColor(annotated_image, cv2.COLOR_BGR2RGB))
-        axis.set_title(title, loc="left", color="#172b27", fontsize=12, fontweight="bold", pad=12)
-        axis.axis("off")
-    figure.tight_layout(pad=1.8)
+def render_panel(
+    image_bgr: Any,
+    boxes: list[dict[str, Any]],
+    title: str,
+    color: tuple[int, int, int],
+    show_activation: bool = False,
+) -> plt.Figure:
+    # Create one report-style Matplotlib panel with annotated source imagery.
+    annotated = draw_boxes(image_bgr, boxes, color, show_activation=show_activation)
+    figure, axis = plt.subplots(figsize=(7, 5.5), facecolor="#f4f7f2")
+    axis.imshow(cv2.cvtColor(annotated, cv2.COLOR_BGR2RGB))
+    axis.set_title(title, loc="left", color="#172b27", fontsize=12, fontweight="bold", pad=12)
+    axis.axis("off")
+    figure.tight_layout(pad=1.2)
     return figure
 
 
-def build_prediction_table(predictions: list[dict[str, Any]]) -> pd.DataFrame:
-    # Format model outputs as a stable, report-ready table.
-    columns = ["ID", "Class Name", "Confidence", "X Min (px)", "Y Min (px)", "X Max (px)", "Y Max (px)"]
+def build_prediction_table(regions: list[dict[str, Any]]) -> pd.DataFrame:
+    # Format Grad-CAM contours as an exportable localization analysis table.
+    columns = [
+        "Region ID", "Vehicle Class", "Class Score", "Mean Activation",
+        "X Min (px)", "Y Min (px)", "X Max (px)", "Y Max (px)",
+        "Area (px)", "Image Area (%)",
+    ]
     rows = [
         {
-            "ID": index,
-            "Class Name": item["class_name"],
-            "Confidence": item["confidence"],
+            "Region ID": item["region_id"],
+            "Vehicle Class": item["class_name"],
+            "Class Score": item["class_score"],
+            "Mean Activation": item["mean_activation"],
             "X Min (px)": item["x_min"],
             "Y Min (px)": item["y_min"],
             "X Max (px)": item["x_max"],
             "Y Max (px)": item["y_max"],
+            "Area (px)": item["area_px"],
+            "Image Area (%)": item["area_percent"],
         }
-        for index, item in enumerate(predictions, start=1)
+        for item in regions
     ]
     return pd.DataFrame(rows, columns=columns)
 
 
-# Build sidebar controls and validate the expected local dataset structure.
-st.sidebar.markdown("## Analysis controls")
-st.sidebar.caption("Select a training image and adjust the detector confidence threshold.")
-confidence_threshold = st.sidebar.slider(
-    "YOLO confidence threshold",
-    min_value=0.1,
-    max_value=1.0,
-    value=0.25,
+# Expose localization and morphology controls for reproducible region extraction.
+st.sidebar.markdown("## Localization controls")
+st.sidebar.caption("Tune the class activation map and the contour-cleanup operation.")
+localization_threshold = st.sidebar.slider(
+    "Grad-CAM threshold",
+    min_value=0.05,
+    max_value=0.95,
+    value=0.80,
     step=0.05,
     format="%.2f",
+)
+morphology_kernel = st.sidebar.slider(
+    "Morphological kernel size",
+    min_value=1,
+    max_value=21,
+    value=1,
+    step=2,
+    help="Odd-sized elliptical kernel used by morphological opening.",
+)
+opening_iterations = st.sidebar.slider(
+    "Opening iterations",
+    min_value=1,
+    max_value=5,
+    value=1,
+    step=1,
+)
+minimum_area_percent = st.sidebar.slider(
+    "Minimum region area (% of image)",
+    min_value=0.01,
+    max_value=2.00,
+    value=0.10,
+    step=0.01,
+    format="%.2f%%",
 )
 
 if not IMAGE_DIR.is_dir():
@@ -279,10 +400,10 @@ selected_image = st.sidebar.selectbox(
     format_func=lambda path: path.name,
 )
 
-st.markdown('<p class="dashboard-kicker">Computer vision · object detection</p>', unsafe_allow_html=True)
-st.title("Smart Resort Vehicle Detection & Analytics", anchor=False)
+# st.markdown('<p class="dashboard-kicker">Computer vision · class activation localization</p>', unsafe_allow_html=True)
+st.title("Urban Street Vehicle Detection & InceptionV3 Analytics", anchor=False)
 st.markdown(
-    '<p class="dashboard-subtitle">Compare annotated training data with pretrained YOLOv8n vehicle detections.</p>',
+    '<p class="dashboard-subtitle">Explore class-specific InceptionV3 attention and compare its localized regions with dataset annotations.</p>',
     unsafe_allow_html=True,
 )
 st.caption(f"TRAIN SPLIT  /  {len(sample_images):,} images  /  {selected_image.name}")
@@ -301,47 +422,80 @@ try:
         image_height,
         class_names,
     )
-    with st.spinner("Running vehicle detection..."):
-        model = load_model(str(MODEL_PATH))
-        predictions = predict_vehicles(model, image_bgr, confidence_threshold)
+    with st.spinner("Computing InceptionV3 Grad-CAM and vehicle regions..."):
+        _, gradcam_model = load_inception_models()
+        heatmap, vehicle_class, class_score = compute_gradcam(gradcam_model, image_bgr)
+        regions, morphology_mask = localize_heatmap(
+            heatmap,
+            localization_threshold,
+            morphology_kernel,
+            opening_iterations,
+            minimum_area_percent / 100.0,
+            vehicle_class,
+            class_score,
+        )
 except Exception as error:
-    st.error(f"Unable to complete detection: {error}")
+    st.error(f"Unable to complete InceptionV3 localization: {error}")
     st.stop()
 
 label_path = LABEL_DIR / f"{selected_image.stem}.txt"
 if not label_path.is_file():
     st.warning("No matching ground-truth label file was found for this image.")
+if vehicle_class.startswith("No vehicle class"):
+    st.warning("ImageNet did not produce a vehicle class; the displayed heatmap explains the top non-vehicle class.")
 
-# Summarize outputs, show the comparison, and expose report-ready detections.
-average_confidence = (
-    sum(item["confidence"] for item in predictions) / len(predictions) if predictions else None
-)
+# Summarize annotations, approximate regions, and the selected ImageNet category.
 metric_columns = st.columns(3)
 metric_columns[0].metric("Ground-truth objects", f"{len(ground_truth):,}")
-metric_columns[1].metric("Detected vehicles", f"{len(predictions):,}")
-metric_columns[2].metric(
-    "Average confidence",
-    f"{average_confidence:.1%}" if average_confidence is not None else "N/A",
-)
+metric_columns[1].metric("Candidate regions", f"{len(regions):,}")
+metric_columns[2].metric("Vehicle class score", f"{class_score:.1%}", help=vehicle_class)
 
-st.subheader("Visual comparison", anchor=False)
-figure = render_comparison(image_bgr, ground_truth, predictions)
-st.pyplot(figure, use_container_width=True)
-plt.close(figure)
+st.subheader("Ground truth vs. InceptionV3 localization", anchor=False)
+ground_truth_column, localization_column = st.columns(2, gap="large")
+with ground_truth_column:
+    ground_truth_figure = render_panel(
+        image_bgr,
+        ground_truth,
+        f"Dataset labels  /  {len(ground_truth)} objects",
+        (255, 0, 0),
+    )
+    st.pyplot(ground_truth_figure, use_container_width=True)
+    plt.close(ground_truth_figure)
+with localization_column:
+    localization_figure = render_panel(
+        image_bgr,
+        regions,
+        f"Grad-CAM candidate regions  /  {len(regions)}",
+        (0, 95, 255),
+        show_activation=True,
+    )
+    st.pyplot(localization_figure, use_container_width=True)
+    plt.close(localization_figure)
 
-st.subheader("Detection records", anchor=False)
-st.caption("Coordinates are pixel values in the source image; confidence is the model score.")
-prediction_table = build_prediction_table(predictions)
+with st.expander("Inspect Grad-CAM heatmap and morphology mask"):
+    heatmap_column, mask_column = st.columns(2)
+    heatmap_column.image(heatmap, caption=f"mixed10 class activation · {vehicle_class}", use_container_width=True, clamp=True)
+    mask_column.image(morphology_mask, caption="Thresholded and morphologically opened mask", use_container_width=True)
+
+st.subheader("Localized region records", anchor=False)
+st.caption("Coordinates and contour areas are source-image pixels; class score and mean activation are distinct quantities.")
+prediction_table = build_prediction_table(regions)
 st.dataframe(
     prediction_table,
     use_container_width=True,
     hide_index=True,
-    column_config={"Confidence": st.column_config.NumberColumn(format="%.4f")},
+    column_config={
+        "Class Score": st.column_config.NumberColumn(format="%.4f"),
+        "Mean Activation": st.column_config.NumberColumn(format="%.4f"),
+        "Image Area (%)": st.column_config.NumberColumn(format="%.3f"),
+    },
 )
 st.download_button(
-    "Download detections as CSV",
+    "Download region analysis as CSV",
     data=prediction_table.to_csv(index=False).encode("utf-8"),
-    file_name=f"{selected_image.stem}_detections.csv",
+    file_name=f"{selected_image.stem}_inceptionv3_regions.csv",
     mime="text/csv",
     icon=":material/download:",
 )
+
+
